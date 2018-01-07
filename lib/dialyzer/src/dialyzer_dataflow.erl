@@ -1725,6 +1725,12 @@ bind_pat_vars([Pat|PatLeft], [Type|TypeLeft], Acc, Map, State, Rev) ->
                                     Map1 = join_maps_end(Maps, MapJ),
                                     TupleType = t_sup([t_tuple(EsTypes)
                                                        || {M, EsTypes} <- Results, M =/= error]),
+                                    _ = lists:map(fun(X) ->
+                                                          case cerl:type(X) of
+                                                              var -> add_to_global_dict(X, Map1, State);
+                                                              _ -> ok
+                                                          end
+                                                  end, Es),
                                     {Map1, TupleType}
                             end
                     end
