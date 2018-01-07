@@ -3865,7 +3865,10 @@ find_terminals_list([], Explicit, Normal) ->
 
 add_to_global_dict(Var, Map, State) ->
     {Env, Envs} = case get(?DT_DICT) of
-                      undefined -> ok;
+                      undefined ->
+                          NewDict = dict:new(),
+                          put(?DT_DICT, NewDict),
+                          {dict:new(), NewDict};
                       Es ->
                           case dict:find(State#state.curr_fun, Es) of
                               error -> {dict:new(), Es};
@@ -3890,7 +3893,7 @@ add_to_global_dict(Var, Map, State) ->
             end;
         {ok, Type} ->
             NewEnv = case Type of
-                         none ->
+                         _ when Type =:= none orelse Type =:= any ->
                              case dict:find(VName, Env) of
                                  error -> dict:store(VName, Type, Env);
                                  {ok, _} -> Env
