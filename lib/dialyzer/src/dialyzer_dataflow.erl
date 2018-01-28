@@ -126,6 +126,10 @@
               modified_stack = [] :: [{[Key :: term()],reference()}],
               ref = undefined     :: reference() | undefined}).
 
+-record(dt_map, {dt_dict = dict:new() :: dict:dict(),
+                 label_to_name = dict:new() :: dict:dict(),
+                 subst = dict:new() :: dict:dict()}).
+
 -type env_tab()   :: dict:dict(label(), #map{}).
 -type fun_entry() :: {Args :: [type()], RetType :: type()}.
 -type fun_tab()   :: dict:dict('top' | label(),
@@ -155,8 +159,8 @@ get_warnings(Tree, Plt, Callgraph, Codeserver, Records) ->
     case get(?DT_DICT) of
         undefined ->
             ok;
-        Es ->
-            %%io:format("\n~p\n", [Es]),
+        CEs ->
+            Es = dict:fold(fun (K, V, A) -> dict:store(K, V#dt_map.dt_dict, A) end, dict:new(), CEs),
             ModuleString = lists:flatten(io_lib:format("~p", [State3#state.module])),
             OutName = "out_" ++ ModuleString,
             case file:open(OutName, [write, raw]) of
@@ -226,7 +230,6 @@ analyze_loop(State) ->
                                     t_to_string(state__fun_type(Fun, NewState1))]),
                             Vars = cerl:fun_vars(Fun),
                             Map1 = enter_type_lists(Vars, ArgTypes, Map),
-                            _ = lists:map(fun(X) -> add_to_global_dict(X, Map1, State) end, Vars),
                             Body = cerl:fun_body(Fun),
                             FunLabel = get_label(Fun),
                             IsRaceAnalysisEnabled = is_race_analysis_enabled(State),
@@ -240,7 +243,6 @@ analyze_loop(State) ->
                                 false -> NewState1
                             end,
                             {NewState4, _Map2, BodyType} = traverse(Body, Map1, NewState3),
-                            lists:map(fun(X) -> add_to_global_dict(X, _Map2, State) end, Vars),
                             ?debug("Done analyzing: ~w:~ts\n",
                                    [NewState1#state.curr_fun,
                                     t_to_string(t_fun(ArgTypes, BodyType))]),
@@ -989,6 +991,7 @@ handle_case(Tree, Map, State) ->
     Arg = cerl:case_arg(Tree),
     Clauses = filter_match_fail(cerl:case_clauses(Tree)),
     {State1, Map1, ArgType} = SMA = traverse(Arg, Map, State),
+    %io:format("Map1: ~p\n", [Map1#map.map]),
     case t_is_none_or_unit(ArgType) of
         true -> SMA;
         false ->
@@ -1014,9 +1017,17 @@ handle_case(Tree, Map, State) ->
                                            S,T,R,M,F andalso (not SupressForced))
                                  end, State3, Warns),
             Map3 = join_maps_end(MapList, Map2),
-            case cerl:type(Arg) of
-                var -> add_to_global_dict(Arg, Map3, State);
-                _ -> ok
+            _ = case cerl:type(Arg) of
+                    var -> add_to_global_dict(Arg, Map3, State);
+                    values ->
+                        Es = cerl:values_es(Arg),
+                        lists:map(fun(X) ->
+                                          case cerl:type(X) of
+                                              var -> add_to_global_dict(X, Map3, State4);
+                                              _ -> ok
+                                          end
+                                  end, Es);
+                    _ -> ok
             end,
             debug_pp_map(Map3),
             {State4, Map3, Type}
@@ -2779,7 +2790,9 @@ bind_guard_case_clauses(_GenArgType, _GenMap, _ArgExpr, [], Map, _Env, _Eval,
                 [Throw|_] -> throw({fail, Throw});
                 [] -> throw({fail, none})
             end;
-        false -> {join_maps_end(AccMaps, Map), AccType}
+        false ->
+            RetMap = join_maps_end(AccMaps, Map),
+            {RetMap, AccType}
     end.
 
 %%% ===========================================================================
@@ -3870,19 +3883,22 @@ find_terminals_list([], Explicit, Normal) ->
 %%----------------------------------------------------------------------------
 
 add_to_global_dict(Var, Map, State) ->
-    {Env, Envs} = case get(?DT_DICT) of
-                      undefined ->
-                          NewDict = dict:new(),
-                          put(?DT_DICT, NewDict),
-                          {dict:new(), NewDict};
-                      Es ->
-                          case dict:find(State#state.curr_fun, Es) of
-                              error -> {dict:new(), Es};
-                              {ok, E} -> {E, Es}
-                          end
-                  end,
+    {TEnv, Envs}= get_func_env(State),
     VName = cerl:var_name(Var),
     [{label, Label}] = lists:filter(fun(X) -> is_tuple(X) andalso element(1, X) == 'label' end, cerl:get_ann(Var)),
+    LabelEnv = case dict:find(Label, TEnv#dt_map.label_to_name) of
+                   {ok, _} -> TEnv;
+                   error ->
+                       NewLabelDict = dict:store(Label, VName, TEnv#dt_map.label_to_name),
+                       TEnv#dt_map{label_to_name = NewLabelDict}
+               end,
+    Env = maps:fold(fun(K, V, A) ->
+                            case dict:find(K, A#dt_map.subst) of
+                                error -> A#dt_map{subst = dict:store(K, V, A#dt_map.subst)};
+                                {ok, V} -> A;
+                                {ok, O} -> io:format("Error, mismatch of subst RHS [had ~p, have ~p] for ~p LHS\n", [O, V, K])
+                            end
+                    end, LabelEnv, Map#map.subst),
     case maps:find(Label, Map#map.map) of
         error ->
             case maps:find(Label, Map#map.subst) of
@@ -3891,25 +3907,75 @@ add_to_global_dict(Var, Map, State) ->
                     case maps:find(Subst, Map#map.map) of
                         error -> ok;
                         {ok, Type} ->
-                            NewEnv = dict:store(VName, Type, Env),
+                            NewDTDict = dict:store(VName, Type, Env#dt_map.dt_dict),
+                            NewEnv = Env#dt_map{dt_dict = NewDTDict},
                             NewEnvs = dict:store(State#state.curr_fun, NewEnv, Envs),
                             put(?DT_DICT, NewEnvs),
                             ok
                     end
             end;
         {ok, Type} ->
-            NewEnv = case Type of
-                         _ when Type =:= none orelse Type =:= any ->
-                             case dict:find(VName, Env) of
-                                 error -> dict:store(VName, Type, Env);
-                                 {ok, _} -> Env
-                             end;
-                         _ -> dict:store(VName, Type, Env)
-                     end,
+            VarInfo = {VName, Label},
+            TNewEnv = maybe_store_to_env(VarInfo, Type, Env),
+            NewEnv = update_subst_types(VarInfo, TNewEnv, Map),
             NewEnvs = dict:store(State#state.curr_fun, NewEnv, Envs),
             put(?DT_DICT, NewEnvs),
             ok
     end.
+
+get_func_env(State) ->
+    case get(?DT_DICT) of
+        undefined ->
+            NewDict = dict:new(),
+            put(?DT_DICT, NewDict),
+            {#dt_map{}, NewDict};
+        Es ->
+            case dict:find(State#state.curr_fun, Es) of
+                error -> {#dt_map{}, Es};
+                {ok, E} -> {E, Es}
+            end
+    end.
+
+maybe_store_to_env(VarInfo, Type, Env) ->
+    {VName, Label} = VarInfo,
+    case Type of
+        _ when Type =:= none orelse Type =:= any ->
+            case dict:find(VName, Env#dt_map.dt_dict) of
+                error -> Env#dt_map{dt_dict = dict:store(VName, Type, Env#dt_map.dt_dict)};
+                {ok, _} -> Env
+            end;
+        _ ->
+            case dict:find(Label, Env#dt_map.subst) of
+                error -> Env#dt_map{dt_dict = dict:store(VName, Type, Env#dt_map.dt_dict)};
+                {ok, RHS} ->
+                    case dict:find(RHS, Env#dt_map.label_to_name) of
+                        error -> Env#dt_map{dt_dict = dict:store(VName, Type, Env#dt_map.dt_dict)};
+                        {ok, SubstVarName} ->
+                            case dict:find(SubstVarName, Env#dt_map.dt_dict) of
+                                G when G =:= error orelse G =:= {ok, Type} ->
+                                    Env#dt_map{dt_dict = dict:store(VName, Type, Env#dt_map.dt_dict)};
+                                _ -> Env
+                            end
+                    end
+            end
+    end.
+
+update_subst_types(VarInfo, Env, Map) ->
+    {VName, Label} = VarInfo,
+    UpdateFunc = fun (Source, Target, Acc) ->
+                         case Target =:= Label of
+                             true ->
+                                 case dict:find(Source, Acc#dt_map.label_to_name) of
+                                     error ->
+                                         Acc;
+                                     {ok, Name} ->
+                                         {ok, T} = dict:find(VName, Acc#dt_map.dt_dict),
+                                         Acc#dt_map{dt_dict = dict:store(Name, T, Acc#dt_map.dt_dict)}
+                                 end;
+                             false -> Acc
+                         end
+                 end,
+    maps:fold(UpdateFunc, Env, Map#map.subst).
 
 %%----------------------------------------------------------------------------
 
